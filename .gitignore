@@ -205,3 +205,64 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# PROJECT SCOPE
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# PyTorch / Weights / Logs
+*.pth
+*.pt
+*.ckpt
+weights/
+checkpoints/
+logs/
+output/
+runs/
+
+# Datasets (CRITICAL: Do not push data)
+data/
+#datasets/
+GAI20/
+*.json
+*.zip
+*.tar.gz
+
+
+
+# Weights
+*.pth
+*.pt
+
+# Datasets & Outputs
+data/
+output/
+__pycache__/
+
+# Compiled C++ Extensions
+models/ops/build/
+models/ops/dist/
+models/ops/*.egg-info/
+
+
+ckpt/
+data/
+output/
+logs/
+ow_labels/
+pretrained/
