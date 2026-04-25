@@ -123,4 +123,6 @@ dataset_file = "ovcoco"
 label_version = "standard" 
 repeat_factor_sampling=False
 num_label_sampled=48 # keep compatible with ovlvis
-##### end dataset parameters ##### 
+use_sam_priors = False
+sam_priors_dir = "data/sam_priors/"
+##### end dataset parameters #####

@@ -266,3 +266,8 @@ output/
 logs/
 ow_labels/
 pretrained/
+
+# SAMethingOVerDrive additions
+outputs/
+wandb/
+CLAUDE.md

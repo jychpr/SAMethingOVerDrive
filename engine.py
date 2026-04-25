@@ -17,6 +17,7 @@ from copy import deepcopy
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator, convert_to_xywh
 from lvis import LVISEval, LVISResults
+from models.ov_dquo.sam_calibrator import SamCalibrator
 # for eval visualize only
 
 
@@ -203,6 +204,7 @@ def evaluate(
         print_freq = 10
     else:
         print_freq = 100
+    sam_calibrator = SamCalibrator() if getattr(args, 'sam_calibrate', False) else None
     _cnt = 0
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device)
@@ -213,6 +215,18 @@ def evaluate(
             }
             for t in targets
         ]
+        if sam_calibrator is not None and getattr(args, 'use_triple_filter', False):
+            for target in targets:
+                try:
+                    image_id = target['image_id'].item()
+                    file_name = data_loader.dataset.coco.imgs[image_id]['file_name']
+                    image_path = os.path.join(data_loader.dataset.root, file_name)
+                    raw = sam_calibrator._run_fastsam(image_path)
+                    if raw is not None:
+                        _, masks_28, _ = raw
+                        target['sam_masks'] = masks_28
+                except Exception:
+                    pass
         outputs = model(
             samples,
             categories=data_loader.dataset.category_list,
@@ -245,7 +259,19 @@ def evaluate(
             metric_logger.update(class_error=0.0)
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         results = postprocessors["bbox"](outputs, orig_target_sizes)
-    
+
+        if sam_calibrator is not None:
+            for target, result in zip(targets, results):
+                try:
+                    image_id = target["image_id"].item()
+                    file_name = data_loader.dataset.coco.imgs[image_id]['file_name']
+                    image_path = os.path.join(data_loader.dataset.root, file_name)
+                    result["scores"] = sam_calibrator.calibrate(
+                        result["boxes"], result["scores"], image_path
+                    )
+                except Exception:
+                    pass
+
         if args.dataset_file == "ovlvis":
             for target, output in zip(targets, results):
                 image_id = target["image_id"].item()

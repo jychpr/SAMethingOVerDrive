@@ -3,6 +3,7 @@ import torchvision
 import torch
 import torch.nn.functional as F
 from .attention import multi_head_attention_forward_trans as MHA_woproj
+import math
 COCO_INDEX = [
     4,
     5,
@@ -386,6 +387,51 @@ def sample_feature_vit(
     return normalized_roi_features
 
 @torch.no_grad()
+def crop_and_resize_masks(sam_masks, rpn_boxes, grid_size, image_sizes):
+    """Crop full-image 28x28 SAM masks to each RoI box region and resize to grid_size.
+
+    sam_masks:   list of (N_i, 28, 28) bool tensors, one per image
+    rpn_boxes:   list of (N_i, 4) float tensors in pixel xyxy per image
+    image_sizes: list of (W, H) tuples per image
+    grid_size:   int, target spatial size (7 for RN50, 9 for RN50x4)
+
+    Returns: float tensor of shape (sum(N_i), 1, grid_size, grid_size)
+    """
+    results = []
+    for masks_i, boxes_i, (W, H) in zip(sam_masks, rpn_boxes, image_sizes):
+        n = boxes_i.shape[0]
+        device = boxes_i.device
+        # sizes values are 0-dim tensors; convert to plain float for math ops
+        W_f, H_f = float(W), float(H)
+        if masks_i is None or len(masks_i) == 0:
+            results.append(torch.ones(n, 1, grid_size, grid_size, device=device))
+            continue
+        # masks_i: (N_i, 28, 28) bool on whatever device it came from
+        masks_f = masks_i.to(device=device, dtype=torch.float32)  # (N_i, 28, 28)
+        n_masks = masks_f.shape[0]
+        cropped = []
+        for j in range(n):
+            x1, y1, x2, y2 = boxes_i[j].tolist()
+            x1 = max(0.0, x1); y1 = max(0.0, y1)
+            x2 = min(W_f, x2); y2 = min(H_f, y2)
+            # Map pixel box to 28x28 mask coords
+            mx1 = x1 / W_f * 28; my1 = y1 / H_f * 28
+            mx2 = x2 / W_f * 28; my2 = y2 / H_f * 28
+            # Integer crop bounds
+            c0 = max(0, math.floor(mx1)); r0 = max(0, math.floor(my1))
+            c1 = min(28, math.ceil(mx2)); r1 = min(28, math.ceil(my2))
+            if j < n_masks and r1 > r0 and c1 > c0:
+                patch = masks_f[j, r0:r1, c0:c1].unsqueeze(0).unsqueeze(0)  # (1,1,rH,rW)
+                resized = F.adaptive_max_pool2d(patch, (grid_size, grid_size))
+            else:
+                # No matching SAM mask or degenerate crop → neutral (no suppression)
+                resized = torch.ones(1, 1, grid_size, grid_size, device=device)
+            cropped.append(resized)
+        results.append(torch.cat(cropped, dim=0))  # (n, 1, grid_size, grid_size)
+    return torch.cat(results, dim=0)  # (Total_N, 1, grid_size, grid_size)
+
+
+@torch.no_grad()
 def sample_feature_rn(
     sizes,
     pred_boxes,
@@ -394,6 +440,7 @@ def sample_feature_rn(
     backbone,
     extra_conv=False,
     unflatten=True,
+    sam_masks=None,
 ):
     rpn_boxes = [box_ops.box_cxcywh_to_xyxy(pred) for pred in pred_boxes]
     for i in range(len(rpn_boxes)):
@@ -411,6 +458,9 @@ def sample_feature_rn(
             spatial_scale=1.0,
             aligned=True,
         )
+        if sam_masks is not None:
+            mask_weights = crop_and_resize_masks(sam_masks, rpn_boxes, reso, sizes)
+            roi_features = roi_features * mask_weights
         roi_features = backbone[0].layer4(roi_features)
         roi_features = backbone[0].attn_pool(roi_features, None)
     else:
@@ -454,6 +504,15 @@ def sample_feature_rn(
             spatial_scale=1.0,
             aligned=True,
         )
+
+        # Triple-Filter: suppress background contamination via FastSAM binary masks.
+        # When sam_masks is None this block is skipped entirely — pixel-identical fallback.
+        if sam_masks is not None:
+            grid_size = reso // 2
+            mask_weights = crop_and_resize_masks(sam_masks, rpn_boxes, grid_size, sizes)
+            q = q * mask_weights
+            k = k * mask_weights
+            v = v * mask_weights
 
         q, k, v = q.flatten(2), k.flatten(2), v.flatten(2)
         q = q.mean(-1)  # NC
@@ -500,8 +559,13 @@ def get_match_pseudo_idx(query,targets,thr=0.5):
     proposal=query.clone()
     proposal=box_ops.box_cxcywh_to_xyxy(proposal.flatten(0, 1))
     for t in targets:
-        pseudo_mask=t['pseudo_mask'].to(torch.bool)
-        bbox=box_ops.box_cxcywh_to_xyxy(t['boxes'][pseudo_mask])
+        if t.get('sam_boxes') is not None:
+            # SAM path: use FastSAM boxes as reference geometry for wildcard IoU assignment
+            bbox = box_ops.box_cxcywh_to_xyxy(t['sam_boxes'])
+        else:
+            # Legacy OLN path: use pseudo-labeled GT boxes
+            pseudo_mask = t['pseudo_mask'].to(torch.bool)
+            bbox = box_ops.box_cxcywh_to_xyxy(t['boxes'][pseudo_mask])
         pseudo_gt_box.append(bbox)
         sizes.append(len(bbox))
     pseudo_gt_box = torch.cat(pseudo_gt_box,dim=0)
@@ -515,3 +579,100 @@ def get_match_pseudo_idx(query,targets,thr=0.5):
         else:
             mask.append(torch.zeros(nq,dtype=torch.bool,device=device))
     return torch.stack(mask,dim=0)
+
+
+@torch.no_grad()
+def get_morph_labels_for_proposals(query, targets, thr=0.5):
+    """Return (BS, NQ) long tensor of morph labels (0-3) for each proposal.
+
+    For each proposal, finds the SAM detection with the highest IoU above `thr`
+    and returns its morph_label.  Defaults to 0 (global wildcard) when no match
+    is found or when sam_morph_labels is absent from a target.
+    """
+    bs, nq = query.shape[:2]
+    device = query.device
+    morph_out = torch.zeros(bs, nq, dtype=torch.long, device=device)
+
+    sam_boxes_list = []
+    morph_labels_list = []
+    sizes = []
+    for t in targets:
+        if t.get('sam_boxes') is not None and t.get('sam_morph_labels') is not None:
+            bbox = box_ops.box_cxcywh_to_xyxy(t['sam_boxes'])
+            sam_boxes_list.append(bbox)
+            morph_labels_list.append(t['sam_morph_labels'].to(device))
+            sizes.append(len(bbox))
+        else:
+            sam_boxes_list.append(torch.zeros(0, 4, device=device))
+            morph_labels_list.append(torch.zeros(0, dtype=torch.long, device=device))
+            sizes.append(0)
+
+    if sum(sizes) == 0:
+        return morph_out
+
+    proposal = box_ops.box_cxcywh_to_xyxy(query.flatten(0, 1))
+    all_sam_boxes = torch.cat(sam_boxes_list, dim=0)
+    ious = box_ops.box_iou(proposal, all_sam_boxes)[0]  # (BS*NQ, total_sam)
+    ious = ious.view(bs, nq, -1)                         # (BS, NQ, total_sam)
+
+    for i, (iou_chunk, morph_i) in enumerate(zip(ious.split(sizes, -1), morph_labels_list)):
+        # iou_chunk: (BS, NQ, n_sam_i) — only column-set i belongs to image i
+        if iou_chunk.size(-1) == 0:
+            continue
+        iou_i = iou_chunk[i]                           # (NQ, n_sam_i)
+        best_iou, best_idx = iou_i.max(-1)             # (NQ,)
+        matched = best_iou > thr
+        if matched.any():
+            best_morph = morph_i[best_idx]             # (NQ,) — may index out-of-range if
+            morph_out[i, matched] = best_morph[matched]  # morph_i is non-empty (guaranteed by sizes>0)
+
+    return morph_out
+
+
+@torch.no_grad()
+def get_matched_soft_wildcards(query, targets, thr=0.5):
+    """Return (BS, NQ, text_dim) soft wildcard embeddings matched by IoU.
+
+    Zero vectors are returned for proposals with no IoU match above thr.
+    Caller checks norm > 0 to distinguish matched from unmatched proposals.
+    """
+    bs, nq = query.shape[:2]
+    device = query.device
+
+    sam_boxes_list = []
+    sw_list = []
+    sizes = []
+    text_dim = 0
+
+    for t in targets:
+        if t.get('sam_boxes') is not None and t.get('sam_soft_wildcards') is not None:
+            bbox = box_ops.box_cxcywh_to_xyxy(t['sam_boxes'])
+            sw = t['sam_soft_wildcards'].to(device)
+            sam_boxes_list.append(bbox)
+            sw_list.append(sw)
+            sizes.append(len(bbox))
+            text_dim = sw.shape[-1]
+        else:
+            sam_boxes_list.append(torch.zeros(0, 4, device=device))
+            sw_list.append(None)
+            sizes.append(0)
+
+    if text_dim == 0 or sum(sizes) == 0:
+        return torch.zeros(bs, nq, max(text_dim, 1), device=device)
+
+    out = torch.zeros(bs, nq, text_dim, device=device)
+    proposal = box_ops.box_cxcywh_to_xyxy(query.flatten(0, 1))
+    all_sam_boxes = torch.cat(sam_boxes_list, dim=0)
+    ious = box_ops.box_iou(proposal, all_sam_boxes)[0]  # (BS*NQ, total_sam)
+    ious = ious.view(bs, nq, -1)
+
+    for i, (iou_chunk, sw_i) in enumerate(zip(ious.split(sizes, -1), sw_list)):
+        if iou_chunk.size(-1) == 0 or sw_i is None:
+            continue
+        iou_i = iou_chunk[i]
+        best_iou, best_idx = iou_i.max(-1)
+        matched = best_iou > thr
+        if matched.any():
+            out[i, matched] = sw_i[best_idx[matched]]
+
+    return out
