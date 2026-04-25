@@ -165,23 +165,34 @@ def prepare_for_cdn_ov(
     return input_query_label, input_query_bbox, attn_mask, dn_meta
 
 def targets_preprocess(targets):
-    new_target=[]
+    new_target = []
     for target in targets:
-        new_target_i=copy.deepcopy(target)
-        pseudo_mask=new_target_i['pseudo_mask'].to(torch.bool)
-        new_target_i['boxes']=new_target_i['boxes'][pseudo_mask]
-        new_target_i['labels']=new_target_i['labels'][pseudo_mask]
-        new_target_i['weight']=new_target_i['weight'][pseudo_mask]
+        new_target_i = copy.deepcopy(target)
+        if new_target_i.get('sam_boxes') is not None:
+            # SAM path: replace boxes/labels/weight with FastSAM detections and
+            # confidence scores as loss weights (Eq. 6 substitution).
+            sam_boxes = new_target_i['sam_boxes']
+            new_target_i['boxes'] = sam_boxes
+            new_target_i['labels'] = torch.full(
+                (len(sam_boxes),), -1, dtype=torch.int64, device=sam_boxes.device
+            )
+            new_target_i['weight'] = new_target_i['sam_scores']
+        else:
+            # Legacy OLN path: filter to pseudo-labeled rows (pseudo_mask == True)
+            pseudo_mask = new_target_i['pseudo_mask'].to(torch.bool)
+            new_target_i['boxes'] = new_target_i['boxes'][pseudo_mask]
+            new_target_i['labels'] = new_target_i['labels'][pseudo_mask]
+            new_target_i['weight'] = new_target_i['weight'][pseudo_mask]
         new_target.append(new_target_i)
     # If there is no pseudo annotation, use a real annotation for training
-    if sum([len(target['labels']) for target in new_target])==0:
-        for i,target in enumerate(targets):
-            new_target_i=copy.deepcopy(target)
-            if len(new_target_i['labels'])>0:
-                new_target_i['boxes']=new_target_i['boxes'][0].unsqueeze(0)
-                new_target_i['labels']=new_target_i['labels'][0].unsqueeze(0)
-                new_target_i['weight']=new_target_i['weight'][0].unsqueeze(0)
-                new_target[i]=new_target_i
+    if sum([len(target['labels']) for target in new_target]) == 0:
+        for i, target in enumerate(targets):
+            new_target_i = copy.deepcopy(target)
+            if len(new_target_i['labels']) > 0:
+                new_target_i['boxes'] = new_target_i['boxes'][0].unsqueeze(0)
+                new_target_i['labels'] = new_target_i['labels'][0].unsqueeze(0)
+                new_target_i['weight'] = new_target_i['weight'][0].unsqueeze(0)
+                new_target[i] = new_target_i
                 break
     return new_target
         

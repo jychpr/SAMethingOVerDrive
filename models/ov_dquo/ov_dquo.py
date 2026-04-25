@@ -8,6 +8,7 @@ from models.transformer.ov_deformable_transformer import build_ov_deformable_tra
 from util import box_ops
 from models.ov_dquo.ov_dn_components import dn_post_process, prepare_for_cdn_ov
 from models.ov_dquo.ov_postprocess import OVPostProcess
+from models.ov_dquo.disagreement_miner import mine_disagreement_regions
 from models.registry import MODULE_BUILD_FUNCS
 import torch.nn as nn
 from .utils import MLP
@@ -19,6 +20,14 @@ from util.misc import (
 import torch.nn.functional as F
 from torchvision.ops import box_iou
 from ..transformer.base import sample_feature_rn,sample_feature_vit
+
+MORPH_WILDCARDS = {
+    0: "a photo of an object",
+    1: "a photo of a small object",
+    2: "a photo of a large object",
+    3: "a photo of a thin object",
+}
+
 
 class OV_DQUO(nn.Module):
     def __init__(
@@ -166,7 +175,33 @@ class OV_DQUO(nn.Module):
 
         self.classifier = classifier
         self.args = args
+        self._morph_emb_cache = None  # lazily populated on first training forward when use_morph_wildcards=True
+        self._disagreement_buffer = None
         self._reset_parameters()
+
+    def _inject_disagreement_buffer(self, targets):
+        buf = self._disagreement_buffer
+        if not buf:
+            return
+        for i in range(min(len(targets), len(buf))):
+            m = buf[i]
+            if not m or 'boxes' not in m:
+                continue
+            existing = targets[i].get('sam_boxes')
+            dev = existing.device if existing is not None else torch.device('cpu')
+            m_boxes  = m['boxes'].to(dev)
+            m_scores = m['scores'].to(dev)
+            if existing is not None:
+                targets[i]['sam_boxes']  = torch.cat([existing, m_boxes], dim=0)
+                targets[i]['sam_scores'] = torch.cat([targets[i]['sam_scores'], m_scores], dim=0)
+                if targets[i].get('sam_morph_labels') is not None:
+                    targets[i]['sam_morph_labels'] = torch.cat([
+                        targets[i]['sam_morph_labels'],
+                        torch.zeros(len(m_boxes), dtype=torch.int64, device=dev),
+                    ], dim=0)
+            else:
+                targets[i]['sam_boxes']  = m_boxes
+                targets[i]['sam_scores'] = m_scores
 
     def _reset_parameters(self):
         # init input_proj
@@ -186,8 +221,22 @@ class OV_DQUO(nn.Module):
             assert self.args.pseudo_box != ""
             with torch.no_grad():
                 if "RN" in self.args.backbone:
-                    categories.append(self.args.wildcard) # add wildcard embed
-                    text_feature = self.classifier(categories)
+                    if getattr(self.args, 'use_morph_wildcards', False):
+                        # Encode base categories, then append 4 morph wildcards.
+                        # Layout: [classes | small | large | thin | object(global)]
+                        # Global wildcard stays at -1 so DN training is unchanged.
+                        text_feature_base = self.classifier(categories)
+                        if self._morph_emb_cache is None:
+                            morph_texts = [MORPH_WILDCARDS[k] for k in [1, 2, 3, 0]]
+                            self._morph_emb_cache = self.classifier(morph_texts)
+                        morph_embs = self._morph_emb_cache
+                        if morph_embs.device != text_feature_base.device:
+                            morph_embs = morph_embs.to(text_feature_base.device)
+                            self._morph_emb_cache = morph_embs
+                        text_feature = torch.cat([text_feature_base, morph_embs], dim=0)
+                    else:
+                        categories.append(self.args.wildcard) # add wildcard embed
+                        text_feature = self.classifier(categories)
                 else:
                     assert self.args.num_label_sampled > 0
                     text_feature=self.classifier[categories]
@@ -227,6 +276,8 @@ class OV_DQUO(nn.Module):
                 srcs.append(src)
                 masks.append(mask)
                 clip_pos_embeds.append(pos_l)
+        if self.training and getattr(self.args, 'use_disagreement_mining', False) and targets is not None:
+            self._inject_disagreement_buffer(targets)
         # for ov dn
         if self.dn_number > 0 and self.training:
             proj_text_feature = self.transformer.text_proj(text_feature)
@@ -249,6 +300,9 @@ class OV_DQUO(nn.Module):
             dn_attn_mask = None
             dn_meta = None
         # end for ov dn
+        # targets carries sam_boxes and sam_masks per-image for the SAM prior path;
+        # sam_masks (N×28×28 bool) are accessible inside text_query_assign at the
+        # sample_feature_rn call site via targets[i]['sam_masks'] — Phase 4 Triple-Filter hook.
         (
             hs,
             reference,
@@ -344,6 +398,28 @@ class OV_DQUO(nn.Module):
                     for a, b in zip(enc_outputs_class, enc_outputs_coord)
                 ]
         out["dn_meta"] = dn_meta
+        if self.training and getattr(self.args, 'use_disagreement_mining', False) and targets is not None:
+            with torch.no_grad():
+                if "RN" in self.args.backbone:
+                    src = ori_clip_features["layer4"]
+                    sizes = [((1 - m[0].float()).sum(), (1 - m[:, 0].float()).sum()) for m in src.decompose()[1]]
+                    roi_f = sample_feature_rn(sizes, outputs_coord_list[-1].detach(), src.tensors, self.args, self.backbone)
+                else:
+                    src = ori_clip_features["dense"]
+                    sizes = [((1 - m[0].float()).sum(), (1 - m[:, 0].float()).sum()) for m in src.decompose()[1]]
+                    roi_f = sample_feature_vit(sizes, outputs_coord_list[-1].detach(), src.tensors)
+                tf_base = text_feature[:self.args.num_label_sampled]
+                raw = roi_f @ tf_base.t()
+                cls_dist = torch.cat([raw, torch.ones_like(raw[:, :, :1]) * (-1.0)], dim=-1)
+                cls_dist = (cls_dist * 100).softmax(dim=-1)[:, :, :-1]
+                self._disagreement_buffer = mine_disagreement_regions(
+                    cls_dist,
+                    outputs_coord_list[-1].detach(),
+                    [t.get('sam_boxes') for t in targets],
+                    [t.get('sam_scores') for t in targets],
+                    base_class_count=self.args.num_label_sampled,
+                    entropy_threshold=getattr(self.args, 'disagreement_entropy_threshold', 1.5),
+                )
         if not self.training:
             sample_box = outputs_coord_list[-1:]
             roi_feats = []
@@ -351,13 +427,19 @@ class OV_DQUO(nn.Module):
                 if "RN" in self.args.backbone:
                     src_feature = ori_clip_features["layer3"] # C4 in ResNet
                     sizes = [((1 - m[0].float()).sum(), (1 - m[:, 0].float()).sum()) for m in src_feature.decompose()[1]]
+                    inf_sam_masks = None
+                    if getattr(self.args, 'use_triple_filter', False) and targets is not None:
+                        inf_sam_masks = [t.get('sam_masks') for t in targets]
+                        if not any(m is not None for m in inf_sam_masks):
+                            inf_sam_masks = None
                     roi_feats.append(sample_feature_rn(
                                             sizes,
                                            coord,
                                            src_feature.tensors,
                                            self.args,
                                            self.backbone,
-                                           extra_conv=True))
+                                           extra_conv=True,
+                                           sam_masks=inf_sam_masks))
                 else:
                     src_feature = ori_clip_features["dense"] # dense feature for ViT
                     sizes = [((1 - m[0].float()).sum(), (1 - m[:, 0].float()).sum()) for m in src_feature.decompose()[1]]

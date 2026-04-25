@@ -1,8 +1,35 @@
 import torch
 from models.ov_dquo.utils import MLP, gen_encoder_output_proposals
 from models.transformer.deformable_transformer import DeformableTransformer
-from .base import sample_feature_vit, sample_feature_rn, get_match_pseudo_idx, COCO_INDEX, LVIS_INDEX
+from .base import sample_feature_vit, sample_feature_rn, get_match_pseudo_idx, get_morph_labels_for_proposals, get_matched_soft_wildcards, COCO_INDEX, LVIS_INDEX
 import torch.nn.functional as F
+from util import box_ops
+
+
+@torch.no_grad()
+def compute_sam_objectness(enc_boxes_sig, targets, iou_thr=0.3):
+    """Return max SAM confidence for each encoder position with IoU > iou_thr.
+
+    enc_boxes_sig: (bs, nhw, 4) cxcywh normalized [0,1]
+    Returns: f (bs, nhw) in [0, 1], zero where no SAM box overlaps.
+    """
+    bs, nhw = enc_boxes_sig.shape[:2]
+    device = enc_boxes_sig.device
+    f = torch.zeros(bs, nhw, device=device)
+    enc_xyxy = box_ops.box_cxcywh_to_xyxy(enc_boxes_sig)  # (bs, nhw, 4)
+    for i, t in enumerate(targets):
+        sam_boxes = t.get('sam_boxes')
+        sam_scores = t.get('sam_scores')
+        if sam_boxes is None or len(sam_boxes) == 0:
+            continue
+        sam_xyxy = box_ops.box_cxcywh_to_xyxy(sam_boxes.to(device))  # (M, 4)
+        sc = sam_scores.to(device)                                     # (M,)
+        iou = box_ops.box_iou(enc_xyxy[i], sam_xyxy)[0]               # (nhw, M)
+        above_thr = iou > iou_thr
+        masked = torch.where(above_thr, sc.unsqueeze(0).expand(nhw, -1), torch.zeros_like(iou))
+        f[i] = masked.max(-1)[0]
+    return f
+
 
 class OVDeformableTransformer(DeformableTransformer):
     def __init__(self, args, **kwargs):
@@ -90,9 +117,14 @@ class OVDeformableTransformer(DeformableTransformer):
                 output_memory = output_memory + _pats
                 output_proposals = output_proposals.repeat(1, self.two_stage_pat_embed, 1)
             enc_outputs_class_unselected = self.enc_out_class_embed(output_memory)
-            enc_outputs_coord_unselected = (self.enc_out_bbox_embed(output_memory) + output_proposals)  
+            enc_outputs_coord_unselected = (self.enc_out_bbox_embed(output_memory) + output_proposals)
             topk = self.num_queries
-            topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1]
+            phi_score = enc_outputs_class_unselected.max(-1)[0]  # (bs, nhw) — two-term RoQIs baseline
+            if getattr(self.args, 'use_sam_roqis', False) and targets is not None:
+                alpha2 = getattr(self.args, 'roqis_alpha2', 0.1)
+                f = compute_sam_objectness(enc_outputs_coord_unselected.detach().sigmoid(), targets)
+                phi_score = phi_score.sigmoid().pow(1.0 - alpha2) * (f + 1e-6).pow(alpha2)
+            topk_proposals = torch.topk(phi_score, topk, dim=1)[1]
             # gather boxes
             refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected,1,topk_proposals.unsqueeze(-1).repeat(1, 1, 4),)  # unsigmoid
             refpoint_embed_ = refpoint_embed_undetach.detach()
@@ -187,17 +219,28 @@ class OVDeformableTransformer(DeformableTransformer):
             src_feature = raw_visual_feats["dense"] # dense feature for ViT
         text_feature = raw_text_feats
         if self.args.pseudo_box and self.training:
-            pseudo_feature=text_feature[-1]
-            text_feature=text_feature[:-1] # remove wildcard embedding 
-            mask=get_match_pseudo_idx(region_proposals.sigmoid(),targets)
+            if getattr(self.args, 'use_morph_wildcards', False):
+                # text_feature layout (morph): [classes | small | large | thin | object(global)]
+                morph_features = text_feature[-4:]   # (4, text_dim) — ordered: small, large, thin, global
+                text_feature = text_feature[:-4]     # (num_classes, text_dim)
+                mask = get_match_pseudo_idx(region_proposals.sigmoid(), targets)
+                morph_labels = get_morph_labels_for_proposals(region_proposals.sigmoid(), targets)
+            else:
+                pseudo_feature = text_feature[-1]
+                text_feature = text_feature[:-1]     # remove wildcard embedding
+                mask = get_match_pseudo_idx(region_proposals.sigmoid(), targets)
         sizes = [((1 - m[0].float()).sum(), (1 - m[:, 0].float()).sum()) for m in src_feature.decompose()[1]]
         with torch.no_grad():
             if "RN" in self.args.backbone:
+                triple_filter_masks = None
+                if getattr(self.args, 'use_triple_filter', False) and targets is not None:
+                    triple_filter_masks = [t.get('sam_masks') for t in targets]
                 roi_features=sample_feature_rn(sizes,
                                            region_proposals.sigmoid(),
                                            src_feature.tensors,
                                            self.args,
-                                           backbone)
+                                           backbone,
+                                           sam_masks=triple_filter_masks)
             else:
                 roi_features = sample_feature_vit(sizes,
                                             region_proposals.sigmoid(),
@@ -219,20 +262,38 @@ class OVDeformableTransformer(DeformableTransformer):
             outputs_class = outputs_class[:, :, :-1]  
             classes_ = outputs_class.max(-1)[1]
             if self.args.pseudo_box and self.training:
-                classes_[mask] = self.args.num_label_sampled    # override pseudo class 
+                if getattr(self.args, 'use_morph_wildcards', False):
+                    # Offset mapping: morph_label [0,1,2,3] → [+3,+0,+1,+2] from num_label_sampled
+                    # (global wildcard=0 maps to +3 so it stays at -1 in text_feature)
+                    _MORPH_OFFSET = torch.tensor([3, 0, 1, 2], dtype=torch.long, device=classes_.device)
+                    classes_[mask] = self.args.num_label_sampled + _MORPH_OFFSET[morph_labels[mask]]
+                else:
+                    classes_[mask] = self.args.num_label_sampled    # override pseudo class
             classes_, indices = classes_.sort(-1) 
             indices = indices.unsqueeze(-1).expand(
                 indices.size(0), indices.size(1), 4
             )  #  bs,num_query,  4
         query_box = torch.gather(region_proposals, 1, indices)
         if self.args.pseudo_box and self.training:
-            text_feature=torch.cat((text_feature,pseudo_feature.unsqueeze(0)),dim=0)
+            if getattr(self.args, 'use_morph_wildcards', False):
+                text_feature = torch.cat((text_feature, morph_features), dim=0)
+            else:
+                text_feature = torch.cat((text_feature, pseudo_feature.unsqueeze(0)), dim=0)
         projected_text = self.text_proj(text_feature) 
         if classes_.dim() == 3:
             used_classes_ = classes_[:, :, 0]
         else:
             used_classes_ = classes_
         query_features = (F.one_hot(used_classes_, num_classes=text_feature.size(0)).to(text_feature.dtype)@ projected_text)
+        if getattr(self.args, 'use_soft_wildcards', False) and self.training and targets is not None:
+            sw_embs = get_matched_soft_wildcards(region_proposals.sigmoid(), targets)
+            has_sw = sw_embs.norm(dim=-1) > 0  # (bs, nq)
+            if has_sw.any():
+                sw_proj = self.text_proj(sw_embs.to(projected_text.dtype))  # (bs, nq, hidden_dim)
+                sort_idx = indices[:, :, 0]  # (bs, nq) — sorted→original position map
+                has_sw_s = torch.gather(has_sw.long(), 1, sort_idx).bool()
+                sw_proj_s = torch.gather(sw_proj, 1, sort_idx.unsqueeze(-1).expand_as(sw_proj))
+                query_features = torch.where(has_sw_s.unsqueeze(-1), sw_proj_s, query_features)
         return classes_, query_features, query_box
 
 def build_ov_deformable_transformer(args):

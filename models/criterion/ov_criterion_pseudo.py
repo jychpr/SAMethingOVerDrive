@@ -10,7 +10,10 @@ import torch.nn.functional as F
 class OVSetCriterion_Pseudo(OVSetCriterion):
     def __init__(self,**kwargs):
         super().__init__(**kwargs)
-        self.gamma = 0.5
+        # gamma=1.0: FastSAM confidence scores already encode a calibrated nonlinear
+        # distribution; no additional power dampening (Weibull-style) is needed.
+        # For OLN pseudo-labels (all weight=1.0) this is numerically identical to gamma=0.5.
+        self.gamma = 1.0
 
     def forward(self, outputs, targets):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs' and k != 'enc_outputs'}

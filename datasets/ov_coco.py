@@ -17,7 +17,8 @@ import datasets.transforms as T
 
 class OVCocoDetection(torchvision.datasets.CocoDetection):
     def __init__(
-        self, img_folder, ann_file, transforms, return_masks, pseudo_box
+        self, img_folder, ann_file, transforms, return_masks, pseudo_box,
+        use_sam_priors=False, sam_priors_dir="data/sam_priors/"
     ):
         super(OVCocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
@@ -41,6 +42,9 @@ class OVCocoDetection(torchvision.datasets.CocoDetection):
                 if annotation["image_id"] not in self.pseudo_annotations:
                     self.pseudo_annotations[annotation["image_id"]] = []
                 self.pseudo_annotations[annotation["image_id"]].append(annotation)
+        self.use_sam_priors = use_sam_priors
+        if use_sam_priors:
+            self.sam_split_dir = Path(sam_priors_dir) / Path(img_folder).name
         self.prepare = ConvertCocoPolysToMask(return_masks, map=self.catid2label)
 
 
@@ -57,6 +61,18 @@ class OVCocoDetection(torchvision.datasets.CocoDetection):
         img, target = self.prepare(img, target)
         if self._transforms is not None:
             img, target = self._transforms(img, target)
+        if self.use_sam_priors:
+            sam_path = self.sam_split_dir / f"{image_id}.pt"
+            if sam_path.exists():
+                sam_data = torch.load(sam_path, weights_only=True)
+                target["sam_boxes"] = sam_data["boxes"]
+                target["sam_masks"] = sam_data["masks"]
+                target["sam_scores"] = sam_data["scores"]
+                if "morph_labels" in sam_data:
+                    target["sam_morph_labels"] = sam_data["morph_labels"]
+                if "soft_wildcard_embs" in sam_data:
+                    target["sam_soft_wildcards"] = sam_data["soft_wildcard_embs"]
+            # else: no .pt file — sam_* keys absent; downstream uses .get() which returns None
         return img, target
 
 
@@ -225,5 +241,7 @@ def build(image_set, args):
         transforms=make_coco_transforms(image_set, args),
         return_masks=args.masks,
         pseudo_box=args.pseudo_box,
+        use_sam_priors=getattr(args, 'use_sam_priors', False),
+        sam_priors_dir=getattr(args, 'sam_priors_dir', 'data/sam_priors/'),
     )
     return dataset
