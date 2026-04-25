@@ -1,7 +1,23 @@
 # SAMethingOVerDrive
 SAM Priors Localization for Open Vocabulary Detection
 
-# Setup
+SAMethingOVerDrive extends [OV-DQUO (AAAI 2025)](https://github.com/xiaomoguhz/OV-DQUO) by replacing its OLN+FE pseudo-labeling pipeline with offline FastSAM segmentation priors, using FastSAM confidence as a foreground quality signal for wildcard proposal weighting. Novel category localization is further improved through mask-guided CLIP feature purification (Triple-Filter), morphology-aware and CLIP-retrieved semantic wildcards that replace the generic `"object"` token, and FastSAM-augmented Region Query Initialization (RoQIS) that seeds decoder queries directly from SAM-localized regions each forward pass. A detector–SAM disagreement mining buffer (T+1 buffer) additionally recovers novel objects that the detector misses but FastSAM confidently segments, closing the localization gap on unseen categories in the OV-COCO benchmark. All six components are individually toggleable via config flags and evaluated in a cumulative ablation over the OV-DQUO baseline.
+
+## Table of Contents
+- [Initial Setup](#initial-setup)
+  - [Environment and Dependencies Setup](#environment-and-dependencies-setup)
+  - [Data Preparation & Checkpoints](#data-preparation--checkpoints)
+  - [Downloading Required Files (CLI / SSH)](#downloading-required-files-cli--ssh)
+- [How to Run](#how-to-run)
+  - [Precomputation Pipeline](#precomputation-pipeline)
+  - [Training](#training)
+  - [Evaluation](#evaluation)
+- [Results](#results)
+  - [Ablation Study](#ablation-study)
+  - [Method Components](#method-components)
+
+# Initial Setup
+## Environment and Dependencies Setup
 1. Clone the repository and go to directory
 ```bash
 git clone git@github.com:jychpr/SAMethingOVerDrive.git
@@ -50,7 +66,7 @@ To execute the offline SAM prior generation scripts located in tools/sam_priors/
 pip install ultralytics openpyxl
 ```
 
-# Data Preparation & Checkpoints
+## Data Preparation & Checkpoints
 Ensure your directory structure aligns with standard COCO formats. Pre-trained base weights (OVDQUO_RN50_COCO.pth) must be placed in the /ckpt/ directory prior to evaluation.
 
 And please make sure that you have these in your folders, if not, refer to the original OV-DQUO repo to download the weights:
@@ -78,33 +94,89 @@ These for the dataset ov-coco, coco2017 images, and also the annotations of orig
 - data/Images/val2017
 - data/Images/test2017
 
-# Precomputing SAM Priors (Step 1 — before training)
+If the above hasn't been done, please check the following section
+
+## Downloading Required Files (CLI / SSH)
+
+This section is for headless or SSH environments. Install gdown first:
+
+```bash
+pip install gdown
+```
+
+Then run the following commands from the repo root to download and place all required files.
+
+**OV-DQUO Checkpoints**
+```bash
+mkdir -p ckpt
+gdown "https://drive.google.com/uc?id=17Nlo0V4jrJz0bNvivfFXcOcaYZq-Up3x" -O ckpt/OVDQUO_RN50_COCO.pth
+gdown "https://drive.google.com/uc?id=1bDxIj1spUmqrMRNHGzK5TZd9uhL9T1KG" -O ckpt/OVDQUO_RN50x4_COCO.pth
+```
+
+**Pretrained Region-Prompt Weights**
+```bash
+mkdir -p pretrained
+gdown --folder "https://drive.google.com/drive/folders/17mi8O1YW6dl8TRkwectHRoC8xbK5sLMw" -O pretrained/
+```
+
+**OW Label JSONs**
+```bash
+mkdir -p ow_labels
+gdown --folder "https://drive.google.com/drive/folders/1j-i6BkbsHvD_pNXVZRQ6fmAYOWnF4Ao4" -O ow_labels/
+```
+
+**OV-COCO Annotations**
+```bash
+mkdir -p data/Anotations
+gdown --folder "https://drive.google.com/drive/folders/1Jgkpoz_ILJRI4xRJydi7dQfFjwtAFbef" -O data/Anotations/
+```
+
+> ⚠ **Disk space:** COCO 2017 requires approximately 26 GB of free disk space (19 GB train images, 1 GB val/test images, ~1 GB annotations). Verify available space with `df -h .` before starting.
+
+**COCO 2017 Original Dataset (Images + Annotations)**
+```bash
+mkdir -p data/Images data/Anotations
+
+# Images
+wget -P data/Images/ http://images.cocodataset.org/zips/train2017.zip
+wget -P data/Images/ http://images.cocodataset.org/zips/val2017.zip
+wget -P data/Images/ http://images.cocodataset.org/zips/test2017.zip
+
+# Annotations
+wget -P data/Anotations/ http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+wget -P data/Anotations/ http://images.cocodataset.org/annotations/image_info_test2017.zip
+wget -P data/Anotations/ http://images.cocodataset.org/annotations/image_info_test-dev2017.zip
+
+# Unzip
+unzip data/Images/train2017.zip  -d data/Images/
+unzip data/Images/val2017.zip    -d data/Images/
+unzip data/Images/test2017.zip   -d data/Images/
+unzip data/Anotations/annotations_trainval2017.zip -d data/Anotations/
+unzip data/Anotations/image_info_test2017.zip      -d data/Anotations/
+unzip data/Anotations/image_info_test-dev2017.zip  -d data/Anotations/
+
+# Optional: remove zips to save space
+rm data/Images/*.zip data/Anotations/*.zip
+```
+
+> **Note on gdown folder downloads:** if you hit a Google Drive quota or rate-limit error, add `--remaining-ok` to skip already-downloaded files. For very large folders, consider using `rclone` with a Google service account for more reliable transfers.
+
+
+# How to Run
+
+## Precomputation Pipeline
 
 SAMethingOVerDrive replaces the OLN+FE pseudo-labeling pipeline with offline FastSAM segmentation priors. These must be precomputed once before any training run.
 
-Download the FastSAM weights first (if not already present):
+Download the FastSAM weights first (if not already present). On SSH or headless servers, auto-download may fail silently — use the explicit wget command:
+
 ```bash
-# FastSAM-x.pt will be auto-downloaded by ultralytics on first use,
-# or place it manually in the working directory.
+# Option 1 — explicit download (recommended for SSH/headless environments)
+wget -O FastSAM-x.pt https://github.com/ultralytics/assets/releases/download/v8.3.0/FastSAM-x.pt
+
+# Option 2 — ultralytics will auto-download on first script run if the file is absent
+# (requires outbound internet access from the compute node)
 ```
-
-Run precomputation for both splits (~118k train + 5k val images):
-```bash
-bash scripts/precompute_priors.sh
-```
-
-This writes per-image `.pt` files to `data/sam_priors/train2017/` and `data/sam_priors/val2017/`. Each file contains detection boxes (cx,cy,w,h normalized), 28×28 binary masks, and confidence scores. Images that already have a `.pt` file are skipped, so the script is safe to re-run.
-
-Optional arguments (passed through to the Python script):
-```bash
-bash scripts/precompute_priors.sh --model /path/to/FastSAM-x.pt --splits train2017
-```
-
-## SAMethingOVerDrive: Proposed Method
-
-SAMethingOVerDrive extends [OV-DQUO (AAAI 2025)](https://github.com/xiaomoguhz/OV-DQUO) by replacing its OLN+FE pseudo-labeling pipeline with offline FastSAM segmentation priors, using FastSAM mask confidence as a direct foreground quality signal for wildcard proposal weighting. Novel category localization is further improved through mask-guided CLIP feature purification (Triple-Filter), morphology-aware and CLIP-retrieved semantic wildcards that replace the generic `"object"` token, and FastSAM-augmented Region Query Initialization (RoQIS) that seeds decoder queries directly from SAM-localized regions each forward pass. A detector–SAM disagreement mining buffer (T+1 buffer) additionally recovers novel objects that the detector misses but FastSAM confidently segments, closing the localization gap on unseen categories in the OV-COCO benchmark.
-
-## Precomputation Pipeline
 
 Two precomputation steps must be run **once in order** before any SAMethingOVerDrive training. Outputs are written per-image as `.pt` files; images that already have a file are skipped, so both scripts are safe to resume after interruption.
 
@@ -114,17 +186,25 @@ bash scripts/precompute_priors.sh
 ```
 Writes to `data/sam_priors/train2017/<image_id>.pt` and `data/sam_priors/val2017/<image_id>.pt`. Each file contains detection boxes (cx, cy, w, h normalized to [0,1]), 28×28 binary masks, and per-box confidence scores.
 
+> ✓ **Sanity check:** `data/sam_priors/train2017/` should contain ~118,287 `.pt` files and `data/sam_priors/val2017/` should contain ~5,000 `.pt` files. Verify with `ls data/sam_priors/train2017/ | wc -l`.
+
 **Step 2 — Soft wildcard embeddings** (~20 min on a single GPU, COCO train2017 only):
 ```bash
 bash scripts/precompute_soft_wildcards.sh
 ```
 Writes to `data/soft_wildcards/train2017/<image_id>.pt`. Each file contains per-box CLIP embedding vectors used as the soft wildcard supervision target.
 
+> ✓ **Sanity check:** `data/soft_wildcards/train2017/` should contain ~118,287 `.pt` files. Verify with `ls data/soft_wildcards/train2017/ | wc -l`.
+
 > Step 2 is only required when `use_soft_wildcards=True` (ablations A4–A6 and the full system). A1–A3 can train from Step 1 output alone.
 
 ## Training
 
 > **Recommended order:** run A1 first to verify the core SAM-prior hypothesis on your hardware before proceeding to the full system.
+>
+> **GPU requirements:** single-GPU training requires a minimum of 24 GB VRAM (tested on RTX 5090). For GPUs with less VRAM, use the distributed training commands and reduce `--batch_size` accordingly.
+
+> **`<output_dir>`** is the path where checkpoints, logs, and evaluation results will be saved. It is created automatically if it does not exist. Use a descriptive name, e.g. `outputs/ablation_A1` or `outputs/full_system_run1`.
 
 **Single-GPU training:**
 ```bash
@@ -146,9 +226,15 @@ bash scripts/OV-COCO/distrain_SAMOVD_RN50.sh <output_dir>
 
 Individual ablation scripts `train_SAMOVD_A2.sh` through `train_SAMOVD_A6.sh` (and their `distrain_` counterparts) follow the same `<output_dir> [device]` interface and correspond to the cumulative configs described in the Ablation Study section below.
 
+Sample command for training (please adjust it accordingly)
+```bash
+bash scripts/OV-COCO/train_SAMOVD_A1.sh outputs/ablation_A1 cuda:0
+```
+
 ## Evaluation
 
-Standard evaluation using a trained checkpoint:
+**Standard evaluation** using the shell script:
+
 ```bash
 bash scripts/OV-COCO/eval_SAMOVD.sh \
   config/OV_COCO/SAMOVD_RN50_full.py \
@@ -156,7 +242,8 @@ bash scripts/OV-COCO/eval_SAMOVD.sh \
   cuda:0
 ```
 
-To enable SAM-calibrated scoring at eval time (rescales detection scores by FastSAM confidence without retraining), invoke `main.py` directly:
+**Evaluation with SAM calibration** — rescales detection scores by FastSAM confidence at inference time, no retraining required. Pass the option directly via `main.py`:
+
 ```bash
 python main.py \
   -c config/OV_COCO/SAMOVD_RN50_full.py \
@@ -168,22 +255,24 @@ python main.py \
   --options sam_calibrate=True
 ```
 
-`sam_calibrate` defaults to `False` in all configs and can be toggled at eval time without retraining.
+> `sam_calibrate` defaults to `False` in all configs and can be toggled at eval time without retraining.
+
+# Results
 
 ## Ablation Study
 
 Results on OV-COCO (RN50 backbone). AP<sup>Novel</sup><sub>50</sub> measures detection AP at IoU=0.50 on novel (unseen) categories.
 
-| Config | Added Component | AP<sup>Novel</sup><sub>50</sub> |
-|--------|-----------------|--------------------------------|
-| OV-DQUO baseline | — (reproduced) | 39.3 |
-| A1 `SAMOVD_RN50_ablation_A1_fastsam_weight.py` | + SAM priors as wildcard proposals | TBD |
-| A2 `SAMOVD_RN50_ablation_A2_triple_filter.py` | + Triple-Filter quality gate | TBD |
-| A3 `SAMOVD_RN50_ablation_A3_morph_wildcard.py` | + Morphological wildcard labels | TBD |
-| A4 `SAMOVD_RN50_ablation_A4_soft_wildcard.py` | + Soft CLIP-similarity wildcard loss | TBD |
-| A5 `SAMOVD_RN50_ablation_A5_roqis.py` | + SAM-guided query initialization (RoQIS) | TBD |
-| A6 `SAMOVD_RN50_ablation_A6_disagreement.py` | + Detector–SAM disagreement mining | TBD |
-| Full `SAMOVD_RN50_full.py` | All components | TBD |
+| Config | Description | AP<sup>Novel</sup><sub>50</sub> |
+|--------|-------------|--------------------------------|
+| OV-DQUO Baseline | Original OV-DQUO (RN50, COCO) | 39.3 |
+| A1 | SAM priors as wildcard proposals (`use_sam_priors`) | TBD |
+| A2 | + Triple-Filter quality gate (`use_triple_filter`) | TBD |
+| A3 | + Morphological wildcard labels (`use_morph_wildcards`) | TBD |
+| A4 | + Soft CLIP-similarity wildcard loss (`use_soft_wildcards`) | TBD |
+| A5 | + SAM-guided query initialization / RoQIS (`use_sam_roqis`) | TBD |
+| A6 | + Detector–SAM disagreement mining (`use_disagreement_mining`) | TBD |
+| Full System | All components enabled | TBD |
 
 > Results will be updated as experiments complete.
 
@@ -191,10 +280,10 @@ Results on OV-COCO (RN50 backbone). AP<sup>Novel</sup><sub>50</sub> measures det
 
 | Component | Addresses | Config Flag | Status |
 |-----------|-----------|-------------|--------|
-| FastSAM Priors | OV-DQUO dependence on OLN+FE pseudo-labels for novel category localization | `use_sam_priors` | Implemented |
-| Triple-Filter | Noisy SAM proposals from invalid box size, aspect ratio, or overlap with GT | `use_triple_filter` | Implemented |
-| Morph Wildcards | Generic `"object"` wildcard losing category-discriminative CLIP signal | `use_morph_wildcards` | Implemented |
-| Soft Wildcards | Hard binary wildcard target ignoring graded CLIP similarity | `use_soft_wildcards` | Implemented |
-| SAM RoQIS | Random query initialization missing SAM-localized foreground regions | `use_sam_roqis` | Implemented |
-| Disagreement Mining | Novel objects confidently detected by SAM but missed by the detector | `use_disagreement_mining` | Implemented |
+| FastSAM Priors | Replaces OLN+FE pseudo-labeling | `use_sam_priors` | Implemented |
+| Triple-Filter | Mask-guided CLIP feature purification | `use_triple_filter` | Implemented |
+| Morph Wildcards | Morphology-aware semantic wildcards | `use_morph_wildcards` | Implemented |
+| Soft Wildcards | CLIP-retrieved semantic wildcards | `use_soft_wildcards` | Implemented |
+| SAM RoQIs | FastSAM-augmented RoI quality selection | `use_sam_roqis` | Implemented |
+| Disagreement Mining | Detector-SAM disagreement as unknown signal | `use_disagreement_mining` | Implemented |
 
