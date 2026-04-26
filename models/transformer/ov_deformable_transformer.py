@@ -290,10 +290,14 @@ class OVDeformableTransformer(DeformableTransformer):
             has_sw = sw_embs.norm(dim=-1) > 0  # (bs, nq)
             if has_sw.any():
                 sw_proj = self.text_proj(sw_embs.to(projected_text.dtype))  # (bs, nq, hidden_dim)
-                sort_idx = indices[:, :, 0]  # (bs, nq) — sorted→original position map
+                nq = sw_proj.shape[1]
+                sort_idx = indices[:, :, 0].clamp(0, nq - 1)  # guard gather OOB
                 has_sw_s = torch.gather(has_sw.long(), 1, sort_idx).bool()
                 sw_proj_s = torch.gather(sw_proj, 1, sort_idx.unsqueeze(-1).expand_as(sw_proj))
-                query_features = torch.where(has_sw_s.unsqueeze(-1), sw_proj_s, query_features)
+                is_wildcard = (classes_ >= self.args.num_label_sampled)
+                query_features = torch.where(
+                    (has_sw_s & is_wildcard).unsqueeze(-1), sw_proj_s, query_features
+                )
         return classes_, query_features, query_box
 
 def build_ov_deformable_transformer(args):
