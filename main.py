@@ -194,7 +194,7 @@ def main(args):
     output_dir = Path(args.output_dir)
 
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         model_without_ddp.load_state_dict(checkpoint["model"])
         if args.use_ema:
             if "ema_model" in checkpoint:
@@ -233,6 +233,7 @@ def main(args):
         return
     logger.info("Start training")
     start_time = time.time()
+    best_novel_ap = 0.0
     for epoch in range(args.start_epoch, args.epochs):
         epoch_start_time = time.time()
         if args.distributed:
@@ -286,6 +287,21 @@ def main(args):
             )
             # log
             log_stats.update(**{f"test_{k}": v for k, v in test_stats.items()})
+            novel_ap = test_stats['coco_eval_bbox'][13]
+            if novel_ap > best_novel_ap:
+                best_novel_ap = novel_ap
+                logger.info("New best novel AP: {:.4f} at epoch {}".format(best_novel_ap, epoch))
+                if args.output_dir:
+                    best_weights = {
+                        "model": model_without_ddp.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "lr_scheduler": lr_scheduler.state_dict(),
+                        "epoch": epoch,
+                        "args": args,
+                    }
+                    if args.use_ema:
+                        best_weights.update({"ema_model": ema_m.module.state_dict()})
+                    utils.save_on_master(best_weights, output_dir / "checkpoint_best_regular.pth")
         ep_paras = {"epoch": epoch, "n_parameters": n_parameters}
         log_stats.update(ep_paras)
         try:
