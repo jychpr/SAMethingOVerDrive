@@ -11,5 +11,6 @@ python -m torch.distributed.launch --nproc_per_node=8 --master_addr=${master_add
         --output_dir $output_dir \
         -c config/OV_COCO/SAMOVD_RN50_ablation_A1_fastsam_weight.py \
         --amp \
-        --eval_start_epoch 15 \
+        --eval_start_epoch 5 \
+        --eval_every_epoch 5 \
 
