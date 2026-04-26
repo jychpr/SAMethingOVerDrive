@@ -76,7 +76,9 @@ def prepare_for_cdn_ov(
         if label_noise_ratio > 0:
             p = torch.rand_like(known_labels_expaned.float())
             chosen_indice = torch.nonzero(p < (label_noise_ratio * 0.5)).view(-1)  # half of bbox prob
-            new_label = torch.randint_like(chosen_indice, 0, num_classes)  # randomly put a new one here
+            # Cap noise at label_enc range: morph wildcards inflate num_classes but
+            # label_enc is sized num_label_sampled+1; noise must stay within base classes.
+            new_label = torch.randint_like(chosen_indice, 0, label_enc_embbeding.num_embeddings - 1)
             known_labels_expaned = known_labels_expaned.scatter(0, chosen_indice, new_label)
         if box_noise_scale > 0:
             known_bbox_ = torch.zeros_like(known_bboxs)
@@ -103,7 +105,13 @@ def prepare_for_cdn_ov(
                 known_bbox_[:, 2:] - known_bbox_[:, :2]
             )  #  x,y,x,y->cx,cy,w,h
         m = known_labels_expaned.long().to(device)
-        m[m==-1]=num_classes-1
+        # Map wildcard labels (-1) to the reserved wildcard slot of label_enc, not
+        # num_classes-1: morph wildcards inflate num_classes beyond label_enc's size.
+        m[m == -1] = label_enc_embbeding.num_embeddings - 1
+        assert m.max() < label_enc_embbeding.num_embeddings, (
+            f"label_enc index OOB: max index {m.max().item()} >= "
+            f"embedding size {label_enc_embbeding.num_embeddings}"
+        )
         input_label_embed = label_enc_embbeding(m)
         input_label_embed[positive_idx]+=text_embbeding[-1][None,:] # 正样本text embbeding全为object
         input_label_embed[negative_idx]+=text_embbeding[m[negative_idx]] # 负样本可以有noise text embbeding
